@@ -1,0 +1,21 @@
+<launch>
+    <param name="use_sim_time" value="false"/>
+    <arg name="port_name" value="can0"/>
+    <arg name="simulated_robot" value="false"/>
+    <arg name="odom_topic_name" value="odom"/>
+    <arg name="pub_tf" value="false"/>
+    <arg name="repeat_rate" value="50"/>
+    <node name="um7_dev" pkg="um7" type="um7_driver"/>
+
+    <include file="$(find imu_filter_madgwick)/launch/imu_filter_madgwick.launch"/>
+
+    <include file="$(find scout_base)/launch/scout_base.launch">
+        <arg name="port_name" default="$(arg port_name)"/>
+        <arg name="simulated_robot" default="$(arg simulated_robot)"/>
+        <arg name="odom_topic_name" default="$(arg odom_topic_name)"/>
+	<arg name="pub_tf" default="$(arg pub_tf)"/>
+    </include>
+
+    <node pkg="imu_model" type="imuBias" name="imuBias_exp" output="screen"/>
+
+</launch>
