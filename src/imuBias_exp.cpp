@@ -8,7 +8,7 @@
 
 using namespace Eigen;
 
-Matrix<double, 7, 1> x_temp_prev; 
+Matrix<double, 10, 10> k_prev; 
 
 // Global variables
 double a1 = 0.001;
@@ -20,6 +20,34 @@ double sigma_x = 0.09, sigma_y = 0.09;
 double sigma_vx = 0.005, sigma_vy = 0.005;
 double sigma_ax = 0.05, sigma_ay = 0.05;
 double sigma_h = M_PI*0.75 / 180.0; // 0.5 degree in radians
+
+class HighPassFilter {
+private:
+    double alpha;  // Filter coefficient (tuning parameter)
+    double prev_input;
+    double prev_output;
+
+public:
+    HighPassFilter(double cutoff_freq, double dt) {
+        // Compute alpha using standard RC high-pass formula
+        double RC = 1.0 / (2 * M_PI * cutoff_freq);
+        alpha = RC / (RC + dt);
+        
+        // Initialize previous values to 0
+        prev_input = 0.0;
+        prev_output = 0.0;
+    }
+
+    double apply(double input) {
+        double output = alpha * (prev_output + input - prev_input);
+        
+        // Update previous values
+        prev_input = input;
+        prev_output = output;
+
+        return output;
+    }
+};
 
 class LowPassFilter {
 private:
@@ -46,8 +74,48 @@ public:
     }
 };
 
+class BiquadBandPass {
+private:
+    double a0, a1, a2, b1, b2;
+    double x1, x2, y1, y2;
+
+public:
+    BiquadBandPass(double center_freq, double bandwidth, double sample_rate) {
+        double omega = 2.0 * M_PI * center_freq / sample_rate;
+        double alpha = sin(omega) * sinh(log(2.0) / 2.0 * bandwidth * omega / sin(omega));
+
+        a0 = alpha;
+        a1 = 0.0;
+        a2 = -alpha;
+        b1 = -2.0 * cos(omega);
+        b2 = 1.0 - alpha;
+
+        // Normalize coefficients
+        a0 = a0 / (1.0 + alpha);
+        a1 = a1 / (1.0 + alpha);
+        a2 = a2 / (1.0 + alpha);
+        b1 = b1 / (1.0 + alpha);
+        b2 = b2 / (1.0 + alpha);
+
+        // Initialize past values
+        x1 = x2 = y1 = y2 = 0.0;
+    }
+
+    double apply(double input) {
+        double output = a0 * input + a1 * x1 + a2 * x2 - b1 * y1 - b2 * y2;
+
+        // Shift past values
+        x2 = x1;
+        x1 = input;
+        y2 = y1;
+        y1 = output;
+
+        return output;
+    }
+};
+
 // Normalize an angle in the state vector x, at index `index`
-void normalize_angle(Matrix<double, 7, 1> & x, int index) {
+void normalize_angle(Matrix<double, 10, 1> & x, int index) {
     if (x(index) > M_PI) {
         x(index) -= 2 * M_PI;
     }
@@ -74,7 +142,7 @@ double get_vx(double v, double e=2) {
     }
 }
 
-Matrix<double, 7, 1> control_update(const Matrix<double, 7, 1>& x, const Vector2d& u, double dt) {
+Matrix<double, 10, 1> control_update(const Matrix<double, 10, 1>& x, const Vector2d& u, double dt) {
     double v = u(0);
     double w = u(1);
     if (w == 0) {
@@ -84,19 +152,20 @@ Matrix<double, 7, 1> control_update(const Matrix<double, 7, 1>& x, const Vector2
 
     double vy = get_vy(v, w, dt);
 
-    Matrix<double, 7, 1> x_new;
+    Matrix<double, 10, 1> x_new;
     x_new << -r * sin(x(6)) + r * sin(x(6) + w * dt),
              r * cos(x(6)) - r * cos(x(6) + w * dt),
              v,
              vy,
              v / dt,
              vy / dt,
-             w * dt;
+             w * dt,
+             0, 0, 0;
 
     return x + x_new;
 }
 
-void ekfloc_predict(Matrix<double, 7, 1>& x, Matrix<double, 7, 7>& P, const Vector2d& u, const Vector2d& u_prev, double dt) {
+void ekfloc_predict(Matrix<double, 10, 1>& x, Matrix<double, 10, 10>& P, const Vector2d& u, const Vector2d& u_prev, double dt) {
     double h = x(6);
     double v = u(0);
     double w = u(1);
@@ -113,58 +182,69 @@ void ekfloc_predict(Matrix<double, 7, 1>& x, Matrix<double, 7, 7>& P, const Vect
     double cosh = cos(h);
     double coshwdt = cos(h + w * dt);
 
-    Matrix<double, 7, 7> G;
+    Matrix<double, 10, 10> G;
     // G << 1, 0.5 * (dt * dt), -r * cosh + r * coshwdt,
     //      0, 1, -r * sinh + r * sinhwdt,
     //      0, 0, 1;
-    G << 1, 0, dt, 0, 0.5*(dt*dt), 0, -r*cosh+r*coshwdt,
-         0, 1, 0, dt, 0, 0.5*(dt*dt), -r*sinh+r*sinhwdt,
-         0, 0, 1, 0, dt, 0, 0,
-         0, 0, 0, get_vy(v, w, dt), 0, dt, 0,
+    G << 1, 0, dt, 0, 0.5*(dt*dt), 0, -r*cosh+r*coshwdt, 0, 0, 0,
+         0, 1, 0, dt, 0, 0.5*(dt*dt), -r*sinh+r*sinhwdt, 0, 0, 0,
+         0, 0, 1, 0, dt, 0, 0, 0, 0, 0,
+         0, 0, 0, get_vy(v, w, dt), 0, dt, 0, 0, 0, 0,
+         0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+         0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+         0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+         0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+         0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+         0, 0, 0, 0, 0, 0, 0, 0, 0, 1;
+
+    Matrix<double, 10, 7> V;
+    V << (-sinh + sinhwdt) / w, v * (sin(h) - sinhwdt) / (w * w) + v * coshwdt * dt / w, 0, 0, 0, 0, 0,
+         (cosh - coshwdt) / w, -v * (cosh - coshwdt) / (w * w) + v * sinhwdt * dt / w, 0, 0, 0, 0, 0,
+         1, -v*sin(h)*dt, 0, 0, 0, 0, 0,
+         sin(h), v*cos(h)*dt, 0, 0, 0, 0, 0,
+         0, 0, 1, 0, 0, 0, 0,
+         0, 0, 0, 1, 0, 0, 0,
+         0, dt, 0, 0, 0, 0, 0,
          0, 0, 0, 0, 1, 0, 0,
          0, 0, 0, 0, 0, 1, 0,
          0, 0, 0, 0, 0, 0, 1;
 
-    Matrix<double, 7, 4> V;
-    V << (-sinh + sinhwdt) / w, v * (sin(h) - sinhwdt) / (w * w) + v * coshwdt * dt / w, 0, 0,
-         (cosh - coshwdt) / w, -v * (cosh - coshwdt) / (w * w) + v * sinhwdt * dt / w, 0, 0,
-         1, -v*sin(h)*dt, 0, 0,
-         sin(h), v*cos(h)*dt, 0, 0,
-         0, 0, 1, 0,
-         0, 0, 0, 1,
-         0, dt, 0, 0;
-
-    Matrix<double, 4, 4> M;
-    M << 10 * a1 * v * v + a2 * w * w, 0, 0, 0,
-         0, a3 * v * v + a4 * w * w, 0, 0,
-         0, 0, sigma_ax * sigma_ax, 0,
-         0, 0, 0, sigma_ay * sigma_ay;
+    Matrix<double, 7, 7> M;
+    M << a1 * v * v + a2 * w * w, 0, 0, 0, 0, 0, 0,
+         0, a3 * v * v + a4 * w * w, 0, 0, 0, 0, 0,
+         0, 0, 100 * sigma_ax * sigma_ax, 0, 0, 0, 0,
+         0, 0, 0, sigma_ay * sigma_ay, 0, 0, 0,
+         0, 0, 0, 0, 1e-3, 0, 0,
+         0, 0, 0, 0, 0, 1e-3, 0,
+         0, 0, 0, 0, 0, 0, 1e-3;
 
     v = get_vx(v);
     double vy_dt = get_vy(v, w, dt);
 
-    Matrix<double, 7, 1> x_temp;
+    Matrix<double, 10, 1> x_temp;
     x_temp << -r * sin(x(6)) + r * sin(x(6) + w * dt),
              r * cos(x(6)) - r * cos(x(6) + w * dt),
              v * dt,
              vy_dt,
              (v - v_x_prev) / dt,
              (vy_dt/dt - v_y_prev) / dt,
-             w * dt;
+             w * dt,
+             0, 0, 0;
 
     x += x_temp;
+    
     P = G * P * G.transpose() + V * M * V.transpose();
 }
 
-void ekfloc(Matrix<double, 7, 1>& x, Matrix<double, 7, 7>& P, const Vector2d& u, const Vector2d& u_prev, const Matrix<double, 7, 1>& z, double dt) {
+void ekfloc(Matrix<double, 10, 1>& x, Matrix<double, 10, 10>& P, const Vector2d& u, const Vector2d& u_prev, const Matrix<double, 10, 1>& z, double dt) {
     double h = x(6);
     double v = u(0);
     double w = u(1);
     double v_x_prev = u_prev(0);
     double v_y_prev = u_prev(1);
 
-    LowPassFilter lpf_ax(0.01, 0.1);
-    LowPassFilter lpf_vx(0.1, 0.1);
+    LowPassFilter lpf_vx(0.1, 0.085);
+    BiquadBandPass bpf(0.2, 0.1, 11.765);
 
     if (w == 0) {
         w = 1.e-30;
@@ -176,65 +256,84 @@ void ekfloc(Matrix<double, 7, 1>& x, Matrix<double, 7, 7>& P, const Vector2d& u,
     double cosh = cos(h);
     double coshwdt = cos(h + w * dt);
 
-    Matrix<double, 7, 7> F;
-    F << 1, 0, dt, 0, 0.5*(dt*dt), 0, -r*cosh+r*coshwdt,
-         0, 1, 0, dt, 0, 0.5*(dt*dt), -r*sinh+r*sinhwdt,
-         0, 0, 1, 0, dt, 0, 0,
-         0, 0, 0, get_vy(v, w, dt), 0, dt, 0,
+    Matrix<double, 10, 10> F;
+    F << 1, 0, dt, 0, 0.5*(dt*dt), 0, -r*cosh+r*coshwdt, 0, 0, 0,
+         0, 1, 0, dt, 0, 0.5*(dt*dt), -r*sinh+r*sinhwdt, 0, 0, 0,
+         0, 0, 1, 0, dt, 0, 0, 0, 0, 0,
+         0, 0, 0, get_vy(v, w, dt), 0, dt, 0, 0, 0, 0,
+         0, 0, 1/dt, 0, 1, 0, 0, -1, 0, 0,
+         0, 0, 0, 1/dt, 0, 1, 0, 0, -1, 0,
+         0, 0, 0, 0, 0, 0, 1, 0, 0, -1,
+         0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+         0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+         0, 0, 0, 0, 0, 0, 0, 0, 0, 1;
+
+    Matrix<double, 10, 7> V;
+    V << (-sinh + sinhwdt) / w, v * (sin(h) - sinhwdt) / (w * w) + v * coshwdt * dt / w, 0, 0, 0, 0, 0,
+         (cosh - coshwdt) / w, -v * (cosh - coshwdt) / (w * w) + v * sinhwdt * dt / w, 0, 0, 0, 0, 0,
+         1, -v*sin(h)*dt, 0, 0, 0, 0, 0,
+         sin(h), v*cos(h)*dt, 0, 0, 0, 0, 0,
+         0, 0, 1, 0, 0, 0, 0,
+         0, 0, 0, 1, 0, 0, 0,
+         0, dt, 0, 0, 0, 0, 0,
          0, 0, 0, 0, 1, 0, 0,
-         0, 0, 1/dt, 0, 0, 1, 0,
-         0, 0, 0, 1/dt, 0, 0, 1;
+         0, 0, 0, 0, 0, 1, 0,
+         0, 0, 0, 0, 0, 0, 1;
 
-    Matrix<double, 7, 4> V;
-    V << (-sinh + sinhwdt) / w, v * (sin(h) - sinhwdt) / (w * w) + v * coshwdt * dt / w, 0, 0,
-         (cosh - coshwdt) / w, -v * (cosh - coshwdt) / (w * w) + v * sinhwdt * dt / w, 0, 0,
-         1, -v*sin(h)*dt, 0, 0,
-         sin(h), v*cos(h)*dt, 0, 0,
-         0, 0, 1, 0,
-         0, 0, 0, 1,
-         0, dt, 0, 0;
-
-    Matrix<double, 4, 4> M;
-    M << a1 * v * v + a2 * w * w, 0, 0, 0,
-         0, a3 * v * v + a4 * w * w, 0, 0,
-         0, 0, 100 * sigma_ax * sigma_ax, 0,
-         0, 0, 0, sigma_ay * sigma_ay;
+    Matrix<double, 7, 7> M;
+    M << a1 * v * v + a2 * w * w, 0, 0, 0, 0, 0, 0,
+         0, a3 * v * v + a4 * w * w, 0, 0, 0, 0, 0,
+         0, 0, 100 * sigma_ax * sigma_ax, 0, 0, 0, 0,
+         0, 0, 0, sigma_ay * sigma_ay, 0, 0, 0,
+         0, 0, 0, 0, 1, 0, 0,
+         0, 0, 0, 0, 0, 1, 0,
+         0, 0, 0, 0, 0, 0, 1;
 
     double vy_dt = get_vy(v, w, dt);
-    v = lpf_vx.apply(v);
-    
-    Matrix<double, 7, 1> x_temp;
-    if(dt >= 0.05) {
-        x_temp << -r * sinh + r * sinhwdt,
-         r * cosh - r * coshwdt,
-         v * dt,
-         get_vy(v, w, dt),
-         lpf_ax.apply((v - x(2))/dt);
-         (vy_dt - x(3)) / dt,
-         w * dt;
-    }
+    v = v * dt;
+    Matrix<double, 10, 1> x_temp;
+    x_temp << -r * sinh + r * sinhwdt,
+        r * cosh - r * coshwdt,
+        v,
+        get_vy(v, w, dt),
+        bpf.apply((v * dt - x(2))/dt) - x(7);
+        ((vy_dt - x(3)) / dt) - x(8),
+        (w * dt) - x(9),
+        0, 0, 0;
     x += x_temp;
     P = F * P * F.transpose() + V * M * V.transpose();
 
-    Matrix<double, 7, 7> R = Matrix<double, 7, 7>::Zero();
-    R.diagonal() << sigma_x * sigma_x, sigma_y * sigma_y, sigma_vx * 0.1,
-                    sigma_vy * sigma_vy * 0.1, 2000 * sigma_ax*sigma_ax, sigma_ay*sigma_ay,
-                    sigma_h * sigma_h;
+    Matrix<double, 10, 10> R = Matrix<double, 10, 10>::Zero();
+    R.diagonal() << sigma_x * sigma_x, sigma_y * sigma_y, sigma_vx * 100,
+                    100 * sigma_vy * sigma_vy * 0.1, 2000 * sigma_ax*sigma_ax, sigma_ay*sigma_ay,
+                    sigma_h * sigma_h, 1e-5, 1e-5, 1e-5;
 
-    Matrix<double, 7, 1> z_est = x;
-    Matrix<double, 7, 7> H = Matrix<double, 7, 7>::Identity();
-    Matrix<double, 7, 7> S = H * P * H.transpose() + R;
-    Matrix<double, 7, 7> K = P * H.transpose() * S.inverse();
+    Matrix<double, 10, 1> z_est = x;
+    Matrix<double, 10, 10> H = Matrix<double, 10, 10>::Identity();
+    H(4,7) = -1;  // Bias correction in a_x
+    H(5,8) = -1;  // Bias correction in a_y
+    H(6,9) = -1;  // Bias correction in theta
 
-    Matrix<double, 7, 1> y = z - z_est;
+    Matrix<double, 10, 10> S = H * P * H.transpose() + R;
+    Matrix<double, 10, 10> K = P * H.transpose() * S.inverse();
+
+    Matrix<double, 10, 1> y = z - z_est;
     normalize_angle(y, 6);
+    // std::cout << dt << std::endl;
+    if(abs(K(2,2)) > 1e2 || abs(K(4,4)) > 1e2) {
+        K = k_prev;
+        std::cout << "Anomaly Contained." << std::endl;
+    } else {
+        k_prev = K;
+    }
+
     x += K * y;
 
     // std::cout << "K\n" << K << std::endl;
     // std::cout << "y\n" << y << std::endl;
 
-    Matrix<double, 7, 7> I = Matrix<double, 7, 7>::Identity();
-    Matrix<double, 7, 7> I_KH = I - K * H;
+    Matrix<double, 10, 10> I = Matrix<double, 10, 10>::Identity();
+    Matrix<double, 10, 10> I_KH = I - K * H;
     P = I_KH * P * I_KH.transpose() + K * R * K.transpose();
 }
 
@@ -306,15 +405,15 @@ public:
     void pub_posteriori()
     {
         // Prepare state & control vectors
-        X_ << x_, y_, v_x, v_y, a_x, a_y, theta_;
+        X_ << x_, y_, v_x, v_y, a_x, a_y, theta_, 0, 0, 0;
         U_ << v_x, w_;
-        P_ = Matrix<double, 7, 7>::Identity();
+        P_ = Matrix<double, 10, 10>::Identity();
         P_(2,2) = 0.01;
-
+        P_(4,4) = 0.01;
         synced_time = ros::Time::now();
 
         // Predict step
-        Matrix<double, 7, 1> xp = X_;
+        Matrix<double, 10, 1> xp = X_;
         ekfloc_predict(xp, P_, U_, U_prev, dt_);
 
         // Update step
@@ -346,7 +445,7 @@ private:
         odom_.pose.pose.orientation.z = q.z();
         odom_.pose.pose.orientation.w = q.w();
 
-        odom_.twist.twist.linear.x = v_x;
+        odom_.twist.twist.linear.x = X_(2);
         odom_.twist.twist.angular.z = w_;
 
         pub_.publish(odom_);
@@ -411,10 +510,10 @@ private:
 
     nav_msgs::Odometry odom_;
 
-    Matrix<double, 7, 1> X_;
-    Matrix<double, 7, 1> z_;
+    Matrix<double, 10, 1> X_;
+    Matrix<double, 10, 1> z_;
     Vector2d U_, U_prev;
-    Matrix<double, 7, 7> P_;
+    Matrix<double, 10, 10> P_;
 };
 
 int main(int argc, char** argv)
@@ -425,7 +524,7 @@ int main(int argc, char** argv)
     double t_now = ros::Time::now().toSec() * 1e9 + ros::Time::now().toNSec();
     ImuBias imu_bias_obj(t_now);
 
-    ros::Rate rate(10);
+    ros::Rate rate(12);
     while (ros::ok()) {
         // Process callbacks (IMU + Odom)
         ros::spinOnce();
